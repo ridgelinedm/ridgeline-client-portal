@@ -1,36 +1,61 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Ridgeline Client Portal
 
-## Getting Started
+Self-serve reporting dashboard for Ridgeline clients. Pulls data from Google
+Search Console, GA4, Google Business Profile, and Ahrefs into a single
+white-labeled view per client.
 
-First, run the development server:
+## Stack
+- **Next.js** (App Router) on Vercel
+- **Supabase** — Postgres + Auth (magic-link), with RLS enforcing per-client isolation
+- **Recharts** for charts
+- **googleapis** for GSC / GA4 / GBP, raw `fetch` for Ahrefs API v3
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## Architecture
+
+```
+[Vercel Cron — daily 9am UTC]
+    ↓
+/api/cron/refresh
+    → fetches last ~7 days from each connector for each workspace
+    → upserts into `metric_snapshots`
+
+[Client visits /<workspace-slug>]
+    ↓
+Server component reads from `metric_snapshots` (instant, no API hops)
+RLS scopes the query to workspaces the user is a member of
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+One Google OAuth refresh token (the agency's account) covers GSC + GA4 + GBP
+for every property the agency has been granted access to. Ahrefs uses a single
+API key for all domains.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Data model
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- `workspaces` — one row per client (with connector config + branding fields)
+- `workspace_members` — links Supabase auth users to workspaces (`admin` or `client`)
+- `metric_snapshots` — daily metric values, one row per (workspace, source, date, metric_key, dimensions)
 
-## Learn More
+## Local dev
 
-To learn more about Next.js, take a look at the following resources:
+1. `cp .env.example .env.local` and fill in.
+2. Apply the migration in `supabase/migrations/` — easiest path is to paste it
+   into the Supabase SQL editor for now.
+3. `npm run dev`
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Connector status
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Source | Status      | Notes                                                |
+|--------|-------------|------------------------------------------------------|
+| GSC    | done        | `fetchGscDaily`, `fetchGscTopQueries`               |
+| GA4    | done        | `fetchGa4Daily`, `fetchGa4LandingPages`             |
+| GBP    | stubbed     | Pending Business Profile API access approval        |
+| Ahrefs | done        | `fetchAhrefsDomainSnapshot`, `fetchAhrefsTopKeywords` |
 
-## Deploy on Vercel
+## TODO (post-MVP)
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Manual `Refresh now` button → `/api/refresh/[workspace]`
+- Date range picker (currently hardcoded to last 30 days)
+- Per-workspace branding (logo, primary color)
+- GBP connector once API is approved
+- Top queries / landing pages / keywords tables on the workspace page
+- Admin UI for adding workspaces and inviting client users
