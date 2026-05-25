@@ -45,7 +45,7 @@ npm run lint   # eslint via eslint-config-next
 
 **RLS bypass for the cron job**. The cron route uses `SUPABASE_SERVICE_ROLE_KEY` (via `src/lib/supabase/admin.ts`) to read all workspaces and write `metric_snapshots` regardless of who initiated the request. This key must never reach the browser. Audit any new code paths touching the admin client to confirm they stay server-only.
 
-**Routing**: App Router. `src/app/layout.tsx` → `page.tsx` (workspace list or redirect to default) → `src/app/[workspace]/page.tsx` (dashboard). Workspace page exports `dynamic = "force-dynamic"` — do not try to statically generate it; data is per-user and lives behind RLS. Public routes (allowed without auth) live in `src/middleware.ts`: `/login`, `/auth/*`, `/api/cron/*`, `/api/auth/*`.
+**Routing**: App Router. `src/app/layout.tsx` → `page.tsx` (workspace list or redirect to default) → `src/app/[workspace]/page.tsx` (dashboard). Workspace page exports `dynamic = "force-dynamic"` — do not try to statically generate it; data is per-user and lives behind RLS. Public routes (allowed without auth) live in `src/proxy.ts` (Next.js 16 renamed `middleware` → `proxy`): `/login`, `/auth/*`, `/api/cron/*`, `/api/auth/*`.
 
 ## Deployment
 
