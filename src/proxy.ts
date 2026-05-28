@@ -34,6 +34,7 @@ export async function proxy(request: NextRequest) {
     pathname.startsWith("/login") ||
     pathname.startsWith("/auth") ||
     pathname.startsWith("/api/cron") ||
+    pathname.startsWith("/api/admin") ||
     pathname.startsWith("/api/auth");
 
   if (!user && !isPublic) {
