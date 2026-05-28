@@ -9,7 +9,12 @@ import {
   fetchGscByDevice,
   fetchGscByCountry,
 } from "@/lib/connectors/gsc";
-import { fetchGa4Daily } from "@/lib/connectors/ga4";
+import {
+  fetchGa4Daily,
+  fetchGa4ByPage,
+  fetchGa4BySource,
+  fetchGa4ByDevice,
+} from "@/lib/connectors/ga4";
 import { fetchAhrefsDomainSnapshot } from "@/lib/connectors/ahrefs";
 import type { MetricSource } from "@/lib/types";
 
@@ -125,6 +130,7 @@ export async function GET(request: Request) {
     }
 
     if (ws.ga4_property_id) {
+      // Legacy: top-line daily aggregates feed the overview dashboard.
       await track(results, ws.slug, "ga4", async () => {
         const rows = await fetchGa4Daily(ws.ga4_property_id, startDate, today);
         await upsertLegacyMetricSnapshots(supabase, ws.id, "ga4", rows, [
@@ -132,6 +138,55 @@ export async function GET(request: Request) {
           "totalUsers",
           "conversions",
         ]);
+        return rows.length;
+      });
+
+      // Phase 2: dimensional fact tables feed the explorer.
+      await track(results, ws.slug, "ga4_page", async () => {
+        const rows = await fetchGa4ByPage(
+          ws.ga4_property_id,
+          startDate,
+          today,
+        );
+        await upsertWithWorkspace(
+          supabase,
+          "ga4_page_daily",
+          ws.id,
+          rows,
+          "workspace_id,date,page_path",
+        );
+        return rows.length;
+      });
+
+      await track(results, ws.slug, "ga4_source", async () => {
+        const rows = await fetchGa4BySource(
+          ws.ga4_property_id,
+          startDate,
+          today,
+        );
+        await upsertWithWorkspace(
+          supabase,
+          "ga4_source_daily",
+          ws.id,
+          rows,
+          "workspace_id,date,source,medium,channel_group",
+        );
+        return rows.length;
+      });
+
+      await track(results, ws.slug, "ga4_device", async () => {
+        const rows = await fetchGa4ByDevice(
+          ws.ga4_property_id,
+          startDate,
+          today,
+        );
+        await upsertWithWorkspace(
+          supabase,
+          "ga4_device_daily",
+          ws.id,
+          rows,
+          "workspace_id,date,device",
+        );
         return rows.length;
       });
     }
