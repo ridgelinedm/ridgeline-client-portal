@@ -5,28 +5,12 @@ import { createClient } from "@/lib/supabase/server";
 
 export const dynamic = "force-dynamic";
 
-type GscPageRow = {
-  page: string;
-  clicks: number;
-  impressions: number;
-  ctr: number;
-  position: number;
-};
-
-type Ga4PageRow = {
-  page_path: string;
-  sessions: number;
-  total_users: number;
-  engaged_sessions: number;
-  conversions: number;
-};
-
-type PageAgg = {
+type PageRow = {
   page_path: string;
   clicks: number;
   impressions: number;
   ctr: number;
-  position: number;
+  avg_position: number;
   sessions: number;
   total_users: number;
   engaged_sessions: number;
@@ -39,92 +23,13 @@ type SortKey =
   | "clicks"
   | "impressions"
   | "ctr"
-  | "position"
+  | "avg_position"
   | "sessions"
   | "engagement_rate"
   | "conversions";
 type SortDir = "asc" | "desc";
 
-const ROW_CAP = 50000;
 const DISPLAY_CAP = 1000;
-
-// GSC stores full URLs; GA4 stores paths. Strip protocol/host/query/hash so
-// the join key is the same for both sources.
-function normalizePath(raw: string): string {
-  if (!raw) return raw;
-  let path = raw;
-  if (!path.startsWith("/")) {
-    try {
-      path = new URL(raw).pathname;
-    } catch {
-      const i = raw.indexOf("/", 8);
-      path = i >= 0 ? raw.slice(i) : raw;
-    }
-  }
-  const qi = path.indexOf("?");
-  if (qi >= 0) path = path.slice(0, qi);
-  const hi = path.indexOf("#");
-  if (hi >= 0) path = path.slice(0, hi);
-  if (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
-  return path;
-}
-
-function emptyAgg(page_path: string): PageAgg & {
-  _ctrNumerator: number;
-  _positionNumerator: number;
-} {
-  return {
-    page_path,
-    clicks: 0,
-    impressions: 0,
-    ctr: 0,
-    position: 0,
-    sessions: 0,
-    total_users: 0,
-    engaged_sessions: 0,
-    conversions: 0,
-    engagement_rate: 0,
-    _ctrNumerator: 0,
-    _positionNumerator: 0,
-  };
-}
-
-function aggregate(
-  gsc: GscPageRow[],
-  ga4: Ga4PageRow[],
-): PageAgg[] {
-  const byPath = new Map<string, ReturnType<typeof emptyAgg>>();
-  for (const r of gsc) {
-    const p = normalizePath(r.page);
-    const e = byPath.get(p) ?? emptyAgg(p);
-    e.clicks += r.clicks;
-    e.impressions += r.impressions;
-    e._ctrNumerator += r.ctr * r.impressions;
-    e._positionNumerator += r.position * r.impressions;
-    byPath.set(p, e);
-  }
-  for (const r of ga4) {
-    const p = normalizePath(r.page_path);
-    const e = byPath.get(p) ?? emptyAgg(p);
-    e.sessions += r.sessions;
-    e.total_users += r.total_users;
-    e.engaged_sessions += r.engaged_sessions;
-    e.conversions += r.conversions;
-    byPath.set(p, e);
-  }
-  return [...byPath.values()].map((e) => ({
-    page_path: e.page_path,
-    clicks: e.clicks,
-    impressions: e.impressions,
-    ctr: e.impressions > 0 ? e._ctrNumerator / e.impressions : 0,
-    position: e.impressions > 0 ? e._positionNumerator / e.impressions : 0,
-    sessions: e.sessions,
-    total_users: e.total_users,
-    engaged_sessions: e.engaged_sessions,
-    conversions: e.conversions,
-    engagement_rate: e.sessions > 0 ? e.engaged_sessions / e.sessions : 0,
-  }));
-}
 
 function parseSort(raw: string | undefined): { key: SortKey; dir: SortDir } {
   const allowed: SortKey[] = [
@@ -132,16 +37,15 @@ function parseSort(raw: string | undefined): { key: SortKey; dir: SortDir } {
     "clicks",
     "impressions",
     "ctr",
-    "position",
+    "avg_position",
     "sessions",
     "engagement_rate",
     "conversions",
   ];
-  const [keyRaw, dirRaw] = (raw ?? "clicks_desc").split("_");
   // sessions / engagement_rate include underscores; accept the last token as dir
   const idx = (raw ?? "clicks_desc").lastIndexOf("_");
-  const keyToken = idx >= 0 ? (raw ?? "").slice(0, idx) : keyRaw;
-  const dirToken = idx >= 0 ? (raw ?? "").slice(idx + 1) : dirRaw;
+  const keyToken = idx >= 0 ? (raw ?? "").slice(0, idx) : "clicks";
+  const dirToken = idx >= 0 ? (raw ?? "").slice(idx + 1) : "desc";
   const key = (allowed as string[]).includes(keyToken)
     ? (keyToken as SortKey)
     : "clicks";
@@ -200,43 +104,20 @@ export default async function PagesExplorer(props: {
   const search = sp.search?.trim() ?? "";
   const { key: sortKey, dir: sortDir } = parseSort(sp.sort);
 
-  const baseGsc = (s: string, e: string) =>
-    supabase
-      .from("gsc_page_daily")
-      .select("page,clicks,impressions,ctr,position")
-      .eq("workspace_id", workspace.id)
-      .gte("date", s)
-      .lte("date", e)
-      .range(0, ROW_CAP - 1);
-  const baseGa4 = (s: string, e: string) =>
-    supabase
-      .from("ga4_page_daily")
-      .select("page_path,sessions,total_users,engaged_sessions,conversions")
-      .eq("workspace_id", workspace.id)
-      .gte("date", s)
-      .lte("date", e)
-      .range(0, ROW_CAP - 1);
+  const fetchMetrics = (s: string, e: string) =>
+    supabase.rpc("get_page_metrics", {
+      p_workspace_id: workspace.id,
+      p_start: s,
+      p_end: e,
+    });
 
-  const [
-    { data: currGsc },
-    { data: currGa4 },
-    { data: priorGsc },
-    { data: priorGa4 },
-  ] = await Promise.all([
-    baseGsc(start, end),
-    baseGa4(start, end),
-    baseGsc(priorStart, priorEnd),
-    baseGa4(priorStart, priorEnd),
+  const [{ data: currRows }, { data: priorRows }] = await Promise.all([
+    fetchMetrics(start, end),
+    fetchMetrics(priorStart, priorEnd),
   ]);
 
-  const current = aggregate(
-    (currGsc ?? []) as GscPageRow[],
-    (currGa4 ?? []) as Ga4PageRow[],
-  );
-  const prior = aggregate(
-    (priorGsc ?? []) as GscPageRow[],
-    (priorGa4 ?? []) as Ga4PageRow[],
-  );
+  const current = (currRows ?? []) as PageRow[];
+  const prior = (priorRows ?? []) as PageRow[];
   const priorByPath = new Map(prior.map((r) => [r.page_path, r]));
 
   const filtered = search
@@ -354,7 +235,7 @@ export default async function PagesExplorer(props: {
               />
               <SortHeader
                 label="Avg pos"
-                col="position"
+                col="avg_position"
                 slug={slug}
                 params={{ start, end, search }}
                 sortKey={sortKey}
@@ -411,8 +292,8 @@ export default async function PagesExplorer(props: {
                     delta={p ? delta(r.ctr, p.ctr) : undefined}
                   />
                   <Cell
-                    value={fmtPos(r.position)}
-                    delta={p ? delta(r.position, p.position) : undefined}
+                    value={fmtPos(r.avg_position)}
+                    delta={p ? delta(r.avg_position, p.avg_position) : undefined}
                     invert
                   />
                   <Cell
