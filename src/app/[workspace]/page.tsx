@@ -1,4 +1,5 @@
 import { notFound } from "next/navigation";
+import Link from "next/link";
 import { subDays, format } from "date-fns";
 import { createClient } from "@/lib/supabase/server";
 import { MetricCard } from "@/components/MetricCard";
@@ -66,6 +67,14 @@ export default async function WorkspaceDashboard(props: {
             Last 30 days · {startDate} → {endDate}
           </p>
         </div>
+        <nav className="flex gap-3 text-sm">
+          <Link
+            href={`/${slug}/explore/queries`}
+            className="rounded border border-zinc-300 px-3 py-1 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          >
+            Explore queries →
+          </Link>
+        </nav>
       </header>
 
       <section className="mt-8 grid grid-cols-2 gap-4 md:grid-cols-4">
