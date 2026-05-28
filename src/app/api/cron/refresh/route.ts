@@ -15,7 +15,11 @@ import {
   fetchGa4BySource,
   fetchGa4ByDevice,
 } from "@/lib/connectors/ga4";
-import { fetchAhrefsDomainSnapshot } from "@/lib/connectors/ahrefs";
+import {
+  fetchAhrefsDomainSnapshot,
+  fetchAhrefsOrganicKeywords,
+  fetchAhrefsTopPages,
+} from "@/lib/connectors/ahrefs";
 import type { MetricSource } from "@/lib/types";
 
 export const maxDuration = 60;
@@ -192,36 +196,194 @@ export async function GET(request: Request) {
     }
 
     if (ws.ahrefs_domain) {
-      await track(results, ws.slug, "ahrefs", async () => {
+      // Phase 3: ahrefs_domain_daily replaces the legacy metric_snapshots
+      // Ahrefs writes. DR + refdomains now come from the correct endpoints.
+      await track(results, ws.slug, "ahrefs_domain", async () => {
         const snap = await fetchAhrefsDomainSnapshot(ws.ahrefs_domain, today);
-        await upsertLegacyMetricSnapshots(
-          supabase,
-          ws.id,
-          "ahrefs",
-          [
-            {
-              date: snap.date,
-              organic_traffic: snap.organicTraffic,
-              organic_keywords: snap.organicKeywords,
-              referring_domains: snap.referringDomains,
-              domain_rating: snap.domainRating,
-            },
-          ],
-          [
-            "organic_traffic",
-            "organic_keywords",
-            "referring_domains",
-            "domain_rating",
-          ],
+        await supabase.from("ahrefs_domain_daily").upsert(
+          {
+            workspace_id: ws.id,
+            date: snap.date,
+            org_traffic: snap.org_traffic,
+            org_keywords: snap.org_keywords,
+            domain_rating: snap.domain_rating,
+            ahrefs_rank: snap.ahrefs_rank,
+            refdomains: snap.refdomains,
+            total_backlinks: snap.total_backlinks,
+          },
+          { onConflict: "workspace_id,date" },
         );
         return 1;
+      });
+
+      await track(results, ws.slug, "ahrefs_keywords", async () => {
+        const kws = await fetchAhrefsOrganicKeywords(
+          ws.ahrefs_domain,
+          today,
+          100,
+        );
+        await upsertWithWorkspace(
+          supabase,
+          "ahrefs_organic_keywords",
+          ws.id,
+          kws.map((k) => ({ snapshot_date: today, ...k })),
+          "workspace_id,snapshot_date,keyword",
+        );
+        return kws.length;
+      });
+
+      await track(results, ws.slug, "ahrefs_pages", async () => {
+        const pages = await fetchAhrefsTopPages(ws.ahrefs_domain, today, 50);
+        await upsertWithWorkspace(
+          supabase,
+          "ahrefs_top_pages",
+          ws.id,
+          pages.map((p) => ({ snapshot_date: today, ...p })),
+          "workspace_id,snapshot_date,page",
+        );
+        return pages.length;
       });
     }
 
     // GBP intentionally skipped until API access is approved.
+
+    // Phase 3: recompute health rollup after all sources for this workspace
+    // have refreshed. Reads from metric_snapshots (daily totals) + the new
+    // ahrefs_domain_daily.
+    await track(results, ws.slug, "health_rollup", async () => {
+      await computeHealthRollup(supabase, ws.id, today);
+      return 1;
+    });
   }
 
   return NextResponse.json({ ok: true, results });
+}
+
+// Recompute the workspace_health_daily row for `today`. Compares the current
+// 30-day window against the prior 30-day window for clicks, impressions,
+// sessions, conversions, and avg. position. Health score 0-100 is a weighted
+// blend of those four deltas (clicks heaviest).
+async function computeHealthRollup(
+  supabase: ReturnType<typeof createAdminClient>,
+  workspaceId: string,
+  endDate: string,
+) {
+  const end = endDate;
+  const start30 = isoDaysAgo(endDate, 29);
+  const endPrior = isoDaysAgo(start30, 1);
+  const startPrior = isoDaysAgo(endPrior, 29);
+
+  const fetchRange = async (s: string, e: string) => {
+    const { data } = await supabase
+      .from("metric_snapshots")
+      .select("source, metric_date, metric_key, metric_value")
+      .eq("workspace_id", workspaceId)
+      .gte("metric_date", s)
+      .lte("metric_date", e)
+      .is("dimensions", null);
+    return (data ?? []) as Array<{
+      source: string;
+      metric_date: string;
+      metric_key: string;
+      metric_value: number;
+    }>;
+  };
+
+  const [curr, prior, { data: ahrefsLatestRows }] = await Promise.all([
+    fetchRange(start30, end),
+    fetchRange(startPrior, endPrior),
+    supabase
+      .from("ahrefs_domain_daily")
+      .select("domain_rating,refdomains,org_traffic")
+      .eq("workspace_id", workspaceId)
+      .order("date", { ascending: false })
+      .limit(1),
+  ]);
+
+  const ahrefs = (ahrefsLatestRows?.[0] as
+    | { domain_rating: number; refdomains: number; org_traffic: number }
+    | undefined) ?? { domain_rating: 0, refdomains: 0, org_traffic: 0 };
+
+  const sumKey = (
+    rows: Array<{ source: string; metric_key: string; metric_value: number }>,
+    source: string,
+    key: string,
+  ) =>
+    rows
+      .filter((r) => r.source === source && r.metric_key === key)
+      .reduce((acc, r) => acc + Number(r.metric_value), 0);
+
+  const avgKey = (
+    rows: Array<{ source: string; metric_key: string; metric_value: number }>,
+    source: string,
+    key: string,
+  ) => {
+    const m = rows.filter(
+      (r) => r.source === source && r.metric_key === key,
+    );
+    if (m.length === 0) return 0;
+    return m.reduce((acc, r) => acc + Number(r.metric_value), 0) / m.length;
+  };
+
+  const clicks30 = sumKey(curr, "gsc", "clicks");
+  const impressions30 = sumKey(curr, "gsc", "impressions");
+  const sessions30 = sumKey(curr, "ga4", "sessions");
+  const conversions30 = sumKey(curr, "ga4", "conversions");
+  const avgPos30 = avgKey(curr, "gsc", "position");
+
+  const clicksPrev = sumKey(prior, "gsc", "clicks");
+  const impressionsPrev = sumKey(prior, "gsc", "impressions");
+  const sessionsPrev = sumKey(prior, "ga4", "sessions");
+  const conversionsPrev = sumKey(prior, "ga4", "conversions");
+  const avgPosPrev = avgKey(prior, "gsc", "position");
+
+  // Score components: map a delta % to 0-100. -50% or worse → 0, 0% → 50,
+  // +50% or better → 100. Position score is inverted (lower is better).
+  const deltaOf = (c: number, p: number) =>
+    p === 0 ? (c === 0 ? 0 : 1) : (c - p) / p;
+  const score = (delta: number) => {
+    if (!Number.isFinite(delta)) return 50;
+    const clamped = Math.max(-0.5, Math.min(0.5, delta));
+    return Math.round((clamped + 0.5) * 100);
+  };
+
+  const clicksScore = score(deltaOf(clicks30, clicksPrev));
+  const impressionsScore = score(deltaOf(impressions30, impressionsPrev));
+  const positionScore = score(-deltaOf(avgPos30, avgPosPrev));
+  const conversionsScore = score(deltaOf(conversions30, conversionsPrev));
+
+  const healthScore = Math.round(
+    0.4 * clicksScore +
+      0.2 * impressionsScore +
+      0.2 * positionScore +
+      0.2 * conversionsScore,
+  );
+
+  await supabase.from("workspace_health_daily").upsert(
+    {
+      workspace_id: workspaceId,
+      date: end,
+      clicks_30d: clicks30,
+      impressions_30d: impressions30,
+      sessions_30d: sessions30,
+      conversions_30d: conversions30,
+      avg_position_30d: avgPos30,
+      clicks_prev_30d: clicksPrev,
+      impressions_prev_30d: impressionsPrev,
+      sessions_prev_30d: sessionsPrev,
+      conversions_prev_30d: conversionsPrev,
+      avg_position_prev_30d: avgPosPrev,
+      domain_rating: ahrefs.domain_rating,
+      refdomains: ahrefs.refdomains,
+      org_traffic: ahrefs.org_traffic,
+      health_score: healthScore,
+    },
+    { onConflict: "workspace_id,date" },
+  );
+}
+
+function isoDaysAgo(iso: string, days: number): string {
+  return format(subDays(new Date(iso), days), "yyyy-MM-dd");
 }
 
 async function track(
@@ -247,7 +409,7 @@ async function upsertWithWorkspace(
   supabase: ReturnType<typeof createAdminClient>,
   table: string,
   workspaceId: string,
-  rows: Array<Record<string, string | number>>,
+  rows: Array<Record<string, string | number | null>>,
   onConflict: string,
 ) {
   if (rows.length === 0) return;

@@ -1,7 +1,12 @@
 // Ahrefs API v3 — REST, single bearer token (the agency's), per-domain queries.
 // Docs: https://docs.ahrefs.com/docs/api/reference/
+//
+// IMPORTANT: Always use mode=subdomains for domain-level queries. mode=domain
+// excludes www and other subdomains, which silently undercounts traffic.
 
 const AHREFS_BASE = "https://api.ahrefs.com/v3";
+const MODE = "subdomains" as const;
+const PROTOCOL = "both" as const;
 
 async function ahrefsFetch<T>(
   path: string,
@@ -23,67 +28,145 @@ async function ahrefsFetch<T>(
 
 export type AhrefsDomainSnapshot = {
   date: string;
-  organicTraffic: number;
-  organicKeywords: number;
-  referringDomains: number;
-  domainRating: number;
+  org_traffic: number;
+  org_keywords: number;
+  domain_rating: number;
+  ahrefs_rank: number | null;
+  refdomains: number;
+  total_backlinks: number;
 };
 
+// Domain-level snapshot. Combines three endpoints because DR and refdomains
+// live in separate endpoints from org_traffic / org_keywords.
 export async function fetchAhrefsDomainSnapshot(
   domain: string,
   date: string,
 ): Promise<AhrefsDomainSnapshot> {
-  const data = await ahrefsFetch<{
-    metrics: {
-      org_traffic?: number;
-      org_keywords?: number;
-      refdomains?: number;
-      domain_rating?: number;
-    };
-  }>("/site-explorer/metrics", {
-    target: domain,
-    mode: "domain",
-    date,
-    protocol: "both",
-  });
+  const [metrics, dr, links] = await Promise.all([
+    ahrefsFetch<{
+      metrics: { org_traffic?: number; org_keywords?: number };
+    }>("/site-explorer/metrics", {
+      target: domain,
+      mode: MODE,
+      protocol: PROTOCOL,
+      date,
+    }),
+    ahrefsFetch<{
+      domain_rating: {
+        domain_rating?: number;
+        ahrefs_rank?: number | null;
+      };
+    }>("/site-explorer/domain-rating", {
+      target: domain,
+      protocol: PROTOCOL,
+      date,
+    }),
+    ahrefsFetch<{
+      metrics: {
+        live?: number;
+        live_refdomains?: number;
+      };
+    }>("/site-explorer/backlinks-stats", {
+      target: domain,
+      mode: MODE,
+      protocol: PROTOCOL,
+      date,
+    }),
+  ]);
   return {
     date,
-    organicTraffic: data.metrics.org_traffic ?? 0,
-    organicKeywords: data.metrics.org_keywords ?? 0,
-    referringDomains: data.metrics.refdomains ?? 0,
-    domainRating: data.metrics.domain_rating ?? 0,
+    org_traffic: metrics.metrics.org_traffic ?? 0,
+    org_keywords: metrics.metrics.org_keywords ?? 0,
+    domain_rating: dr.domain_rating.domain_rating ?? 0,
+    ahrefs_rank: dr.domain_rating.ahrefs_rank ?? null,
+    refdomains: links.metrics.live_refdomains ?? 0,
+    total_backlinks: links.metrics.live ?? 0,
   };
 }
 
-export type AhrefsTopKeyword = {
+export type AhrefsOrganicKeyword = {
   keyword: string;
-  position: number;
-  volume: number;
+  best_position: number | null;
+  volume: number | null;
   traffic: number;
+  cpc_cents: number | null;
 };
 
-export async function fetchAhrefsTopKeywords(
+export async function fetchAhrefsOrganicKeywords(
   domain: string,
-  limit = 25,
-): Promise<AhrefsTopKeyword[]> {
+  date: string,
+  limit = 100,
+): Promise<AhrefsOrganicKeyword[]> {
   const data = await ahrefsFetch<{
     keywords: Array<{
-      keyword: string;
-      best_position?: number;
-      volume?: number;
-      traffic?: number;
+      keyword?: string;
+      best_position?: number | null;
+      volume?: number | null;
+      sum_traffic?: number | null;
+      cpc?: number | null;
     }>;
   }>("/site-explorer/organic-keywords", {
     target: domain,
-    mode: "domain",
+    mode: MODE,
+    protocol: PROTOCOL,
+    date,
     limit: String(limit),
-    select: "keyword,best_position,volume,traffic",
-    order_by: "traffic:desc",
+    select: "keyword,best_position,volume,sum_traffic,cpc",
+    order_by: "sum_traffic:desc",
   });
   return (data.keywords ?? []).map((k) => ({
-    keyword: k.keyword,
-    position: k.best_position ?? 0,
-    volume: k.volume ?? 0,
-    traffic: k.traffic ?? 0,
+    keyword: k.keyword ?? "",
+    best_position: k.best_position ?? null,
+    volume: k.volume ?? null,
+    traffic: k.sum_traffic ?? 0,
+    cpc_cents: k.cpc ?? null,
   }));
+}
+
+export type AhrefsTopPage = {
+  page: string;
+  traffic: number;
+  keywords: number;
+  top_keyword: string | null;
+  top_keyword_position: number | null;
+  url_rating: number | null;
+  traffic_value_cents: number | null;
+};
+
+export async function fetchAhrefsTopPages(
+  domain: string,
+  date: string,
+  limit = 50,
+): Promise<AhrefsTopPage[]> {
+  const data = await ahrefsFetch<{
+    pages: Array<{
+      url?: string | null;
+      sum_traffic?: number | null;
+      keywords?: number | null;
+      top_keyword?: string | null;
+      top_keyword_best_position?: number | null;
+      ur?: number | null;
+      value?: number | null;
+    }>;
+  }>("/site-explorer/top-pages", {
+    target: domain,
+    mode: MODE,
+    protocol: PROTOCOL,
+    date,
+    limit: String(limit),
+    select:
+      "url,sum_traffic,keywords,top_keyword,top_keyword_best_position,ur,value",
+    order_by: "sum_traffic:desc",
+  });
+  return (data.pages ?? [])
+    .filter((p) => p.url)
+    .map((p) => ({
+      page: p.url ?? "",
+      traffic: p.sum_traffic ?? 0,
+      keywords: p.keywords ?? 0,
+      top_keyword: p.top_keyword ?? null,
+      top_keyword_position: p.top_keyword_best_position ?? null,
+      url_rating: p.ur ?? null,
+      traffic_value_cents: p.value ?? null,
+    }));
 }
