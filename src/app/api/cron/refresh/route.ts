@@ -1,10 +1,26 @@
 import { NextResponse } from "next/server";
 import { format, subDays } from "date-fns";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { fetchGscDaily } from "@/lib/connectors/gsc";
+import {
+  fetchGscDaily,
+  fetchGscByQuery,
+  fetchGscByPage,
+  fetchGscByQueryPage,
+  fetchGscByDevice,
+  fetchGscByCountry,
+} from "@/lib/connectors/gsc";
 import { fetchGa4Daily } from "@/lib/connectors/ga4";
 import { fetchAhrefsDomainSnapshot } from "@/lib/connectors/ahrefs";
 import type { MetricSource } from "@/lib/types";
+
+export const maxDuration = 60;
+
+type ResultRow = {
+  workspace: string;
+  source: string;
+  rows: number;
+  error?: string;
+};
 
 // Vercel Cron hits this nightly. Protected by a shared secret so randos can't.
 export async function GET(request: Request) {
@@ -25,52 +41,105 @@ export async function GET(request: Request) {
   // GSC has a ~2-3 day lag; 7 days is a safe rolling window to backfill.
   const startDate = format(subDays(new Date(), 7), "yyyy-MM-dd");
 
-  const results: Array<{ workspace: string; source: MetricSource; rows: number; error?: string }> = [];
+  const results: ResultRow[] = [];
 
   for (const ws of workspaces ?? []) {
     if (ws.gsc_property) {
-      try {
+      // Legacy: top-line daily aggregates feed the overview dashboard until the
+      // Phase 3 health-rollup table lands.
+      await track(results, ws.slug, "gsc", async () => {
         const rows = await fetchGscDaily(ws.gsc_property, startDate, today);
-        await upsertDaily(supabase, ws.id, "gsc", rows, [
+        await upsertLegacyMetricSnapshots(supabase, ws.id, "gsc", rows, [
           "clicks",
           "impressions",
           "ctr",
           "position",
         ]);
-        results.push({ workspace: ws.slug, source: "gsc", rows: rows.length });
-      } catch (e) {
-        results.push({
-          workspace: ws.slug,
-          source: "gsc",
-          rows: 0,
-          error: (e as Error).message,
-        });
-      }
+        return rows.length;
+      });
+
+      // Phase 1: dimensional fact tables feed the explorer.
+      await track(results, ws.slug, "gsc_query", async () => {
+        const rows = await fetchGscByQuery(ws.gsc_property, startDate, today);
+        await upsertWithWorkspace(
+          supabase,
+          "gsc_query_daily",
+          ws.id,
+          rows,
+          "workspace_id,date,query",
+        );
+        return rows.length;
+      });
+
+      await track(results, ws.slug, "gsc_page", async () => {
+        const rows = await fetchGscByPage(ws.gsc_property, startDate, today);
+        await upsertWithWorkspace(
+          supabase,
+          "gsc_page_daily",
+          ws.id,
+          rows,
+          "workspace_id,date,page",
+        );
+        return rows.length;
+      });
+
+      await track(results, ws.slug, "gsc_query_page", async () => {
+        const rows = await fetchGscByQueryPage(
+          ws.gsc_property,
+          startDate,
+          today,
+        );
+        await upsertWithWorkspace(
+          supabase,
+          "gsc_query_page_daily",
+          ws.id,
+          rows,
+          "workspace_id,date,query,page",
+        );
+        return rows.length;
+      });
+
+      await track(results, ws.slug, "gsc_device", async () => {
+        const rows = await fetchGscByDevice(ws.gsc_property, startDate, today);
+        await upsertWithWorkspace(
+          supabase,
+          "gsc_device_daily",
+          ws.id,
+          rows,
+          "workspace_id,date,device",
+        );
+        return rows.length;
+      });
+
+      await track(results, ws.slug, "gsc_country", async () => {
+        const rows = await fetchGscByCountry(ws.gsc_property, startDate, today);
+        await upsertWithWorkspace(
+          supabase,
+          "gsc_country_daily",
+          ws.id,
+          rows,
+          "workspace_id,date,country",
+        );
+        return rows.length;
+      });
     }
 
     if (ws.ga4_property_id) {
-      try {
+      await track(results, ws.slug, "ga4", async () => {
         const rows = await fetchGa4Daily(ws.ga4_property_id, startDate, today);
-        await upsertDaily(supabase, ws.id, "ga4", rows, [
+        await upsertLegacyMetricSnapshots(supabase, ws.id, "ga4", rows, [
           "sessions",
           "totalUsers",
           "conversions",
         ]);
-        results.push({ workspace: ws.slug, source: "ga4", rows: rows.length });
-      } catch (e) {
-        results.push({
-          workspace: ws.slug,
-          source: "ga4",
-          rows: 0,
-          error: (e as Error).message,
-        });
-      }
+        return rows.length;
+      });
     }
 
     if (ws.ahrefs_domain) {
-      try {
+      await track(results, ws.slug, "ahrefs", async () => {
         const snap = await fetchAhrefsDomainSnapshot(ws.ahrefs_domain, today);
-        await upsertDaily(
+        await upsertLegacyMetricSnapshots(
           supabase,
           ws.id,
           "ahrefs",
@@ -83,17 +152,15 @@ export async function GET(request: Request) {
               domain_rating: snap.domainRating,
             },
           ],
-          ["organic_traffic", "organic_keywords", "referring_domains", "domain_rating"],
+          [
+            "organic_traffic",
+            "organic_keywords",
+            "referring_domains",
+            "domain_rating",
+          ],
         );
-        results.push({ workspace: ws.slug, source: "ahrefs", rows: 1 });
-      } catch (e) {
-        results.push({
-          workspace: ws.slug,
-          source: "ahrefs",
-          rows: 0,
-          error: (e as Error).message,
-        });
-      }
+        return 1;
+      });
     }
 
     // GBP intentionally skipped until API access is approved.
@@ -102,7 +169,42 @@ export async function GET(request: Request) {
   return NextResponse.json({ ok: true, results });
 }
 
-async function upsertDaily(
+async function track(
+  results: ResultRow[],
+  workspaceSlug: string,
+  source: string,
+  fn: () => Promise<number>,
+) {
+  try {
+    const rows = await fn();
+    results.push({ workspace: workspaceSlug, source, rows });
+  } catch (e) {
+    results.push({
+      workspace: workspaceSlug,
+      source,
+      rows: 0,
+      error: (e as Error).message,
+    });
+  }
+}
+
+async function upsertWithWorkspace(
+  supabase: ReturnType<typeof createAdminClient>,
+  table: string,
+  workspaceId: string,
+  rows: Array<Record<string, string | number>>,
+  onConflict: string,
+) {
+  if (rows.length === 0) return;
+  await supabase
+    .from(table)
+    .upsert(
+      rows.map((r) => ({ workspace_id: workspaceId, ...r })),
+      { onConflict },
+    );
+}
+
+async function upsertLegacyMetricSnapshots(
   supabase: ReturnType<typeof createAdminClient>,
   workspaceId: string,
   source: MetricSource,
