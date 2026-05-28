@@ -67,12 +67,18 @@ export default async function WorkspaceDashboard(props: {
             Last 30 days · {startDate} → {endDate}
           </p>
         </div>
-        <nav className="flex gap-3 text-sm">
+        <nav className="flex gap-2 text-sm">
           <Link
             href={`/${slug}/explore/queries`}
             className="rounded border border-zinc-300 px-3 py-1 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
           >
-            Explore queries →
+            Queries →
+          </Link>
+          <Link
+            href={`/${slug}/explore/pages`}
+            className="rounded border border-zinc-300 px-3 py-1 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          >
+            Pages →
           </Link>
         </nav>
       </header>
