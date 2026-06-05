@@ -2,10 +2,14 @@ import { notFound } from "next/navigation";
 import Link from "next/link";
 import { differenceInDays, format, parseISO, subDays } from "date-fns";
 import { agencyScopedClient } from "@/lib/auth/admin";
+import { delta, fmtPct } from "@/lib/format";
+import { parsePageSort, type PageSortKey, type SortDir } from "@/lib/explore";
 
 export const dynamic = "force-dynamic";
 
-type PageRow = {
+const PAGE_SIZE = 100;
+
+type Row = {
   page_path: string;
   clicks: number;
   impressions: number;
@@ -16,57 +20,20 @@ type PageRow = {
   engaged_sessions: number;
   conversions: number;
   engagement_rate: number;
+  prior_clicks: number;
+  prior_impressions: number;
+  prior_ctr: number;
+  prior_avg_position: number;
+  prior_sessions: number;
+  prior_engaged_sessions: number;
+  prior_conversions: number;
+  prior_engagement_rate: number;
+  total_count: number;
 };
-
-type SortKey =
-  | "page_path"
-  | "clicks"
-  | "impressions"
-  | "ctr"
-  | "avg_position"
-  | "sessions"
-  | "engagement_rate"
-  | "conversions";
-type SortDir = "asc" | "desc";
-
-const DISPLAY_CAP = 1000;
-
-function parseSort(raw: string | undefined): { key: SortKey; dir: SortDir } {
-  const allowed: SortKey[] = [
-    "page_path",
-    "clicks",
-    "impressions",
-    "ctr",
-    "avg_position",
-    "sessions",
-    "engagement_rate",
-    "conversions",
-  ];
-  // sessions / engagement_rate include underscores; accept the last token as dir
-  const idx = (raw ?? "clicks_desc").lastIndexOf("_");
-  const keyToken = idx >= 0 ? (raw ?? "").slice(0, idx) : "clicks";
-  const dirToken = idx >= 0 ? (raw ?? "").slice(idx + 1) : "desc";
-  const key = (allowed as string[]).includes(keyToken)
-    ? (keyToken as SortKey)
-    : "clicks";
-  const dir: SortDir = dirToken === "asc" ? "asc" : "desc";
-  return { key, dir };
-}
-
-function delta(curr: number, prev: number) {
-  if (prev === 0) return curr === 0 ? 0 : 1;
-  return (curr - prev) / prev;
-}
-
-function fmtPct(n: number) {
-  const sign = n > 0 ? "+" : "";
-  return `${sign}${(n * 100).toFixed(1)}%`;
-}
 
 function fmtRate(n: number) {
   return `${(n * 100).toFixed(2)}%`;
 }
-
 function fmtPos(n: number) {
   return n.toFixed(1);
 }
@@ -78,6 +45,7 @@ export default async function PagesExplorer(props: {
     end?: string;
     search?: string;
     sort?: string;
+    page?: string;
   }>;
 }) {
   const { workspace: slug } = await props.params;
@@ -91,8 +59,7 @@ export default async function PagesExplorer(props: {
     .maybeSingle();
   if (!workspace) notFound();
 
-  const today = new Date();
-  const end = sp.end ?? format(today, "yyyy-MM-dd");
+  const end = sp.end ?? format(new Date(), "yyyy-MM-dd");
   const start = sp.start ?? format(subDays(parseISO(end), 29), "yyyy-MM-dd");
   const periodDays = differenceInDays(parseISO(end), parseISO(start)) + 1;
   const priorEnd = format(subDays(parseISO(start), 1), "yyyy-MM-dd");
@@ -102,38 +69,30 @@ export default async function PagesExplorer(props: {
   );
 
   const search = sp.search?.trim() ?? "";
-  const { key: sortKey, dir: sortDir } = parseSort(sp.sort);
+  const { key: sortKey, dir: sortDir } = parsePageSort(sp.sort);
+  const page = Math.max(1, parseInt(sp.page ?? "1", 10) || 1);
+  const offset = (page - 1) * PAGE_SIZE;
 
-  const fetchMetrics = (s: string, e: string) =>
-    supabase.rpc("get_page_metrics", {
-      p_workspace_id: workspace.id,
-      p_start: s,
-      p_end: e,
-    });
-
-  const [{ data: currRows }, { data: priorRows }] = await Promise.all([
-    fetchMetrics(start, end),
-    fetchMetrics(priorStart, priorEnd),
-  ]);
-
-  const current = (currRows ?? []) as PageRow[];
-  const prior = (priorRows ?? []) as PageRow[];
-  const priorByPath = new Map(prior.map((r) => [r.page_path, r]));
-
-  const filtered = search
-    ? current.filter((r) =>
-        r.page_path.toLowerCase().includes(search.toLowerCase()),
-      )
-    : current;
-
-  const sorted = [...filtered].sort((a, b) => {
-    const cmp =
-      sortKey === "page_path"
-        ? a.page_path.localeCompare(b.page_path)
-        : (a[sortKey] as number) - (b[sortKey] as number);
-    return sortDir === "asc" ? cmp : -cmp;
+  const { data: rpcData } = await supabase.rpc("gsc_pages_agg", {
+    p_workspace_id: workspace.id,
+    p_start: start,
+    p_end: end,
+    p_prior_start: priorStart,
+    p_prior_end: priorEnd,
+    p_search: search,
+    p_sort: sortKey,
+    p_dir: sortDir,
+    p_limit: PAGE_SIZE,
+    p_offset: offset,
   });
-  const visible = sorted.slice(0, DISPLAY_CAP);
+  const rows = (rpcData ?? []) as Row[];
+  const total = Number(rows[0]?.total_count ?? 0);
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const firstRow = total === 0 ? 0 : offset + 1;
+  const lastRow = Math.min(offset + rows.length, total);
+
+  const baseParams = { start, end, search };
+  const exportQs = makeQs({ start, end, search, sort: `${sortKey}_${sortDir}` });
 
   return (
     <main className="mx-auto max-w-7xl px-6 py-10">
@@ -151,7 +110,7 @@ export default async function PagesExplorer(props: {
           </p>
         </div>
         <a
-          href={`/api/${slug}/export/pages?start=${start}&end=${end}`}
+          href={`/api/${slug}/export/pages?${exportQs}`}
           className="rounded border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
         >
           Download CSV
@@ -193,133 +152,44 @@ export default async function PagesExplorer(props: {
         </button>
       </form>
 
-      <p className="mt-4 text-xs text-zinc-500">
-        {filtered.length.toLocaleString()} pages
-        {sorted.length > DISPLAY_CAP
-          ? ` · showing top ${DISPLAY_CAP.toLocaleString()}`
-          : ""}
-      </p>
+      <div className="mt-4 flex items-center justify-between text-xs text-zinc-500">
+        <span>
+          {total.toLocaleString()} pages
+          {total > 0 ? ` · showing ${firstRow.toLocaleString()}–${lastRow.toLocaleString()}` : ""}
+        </span>
+        <Pager slug={slug} params={baseParams} sort={`${sortKey}_${sortDir}`} page={page} totalPages={totalPages} />
+      </div>
 
       <div className="mt-2 overflow-x-auto rounded-xl border border-zinc-200 dark:border-zinc-800">
         <table className="min-w-full text-sm">
           <thead className="bg-zinc-50 text-left text-xs uppercase tracking-wide text-zinc-500 dark:bg-zinc-900">
             <tr>
-              <SortHeader
-                label="Page"
-                col="page_path"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-              />
-              <SortHeader
-                label="Clicks"
-                col="clicks"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-                align="right"
-              />
-              <SortHeader
-                label="Impr."
-                col="impressions"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-                align="right"
-              />
-              <SortHeader
-                label="CTR"
-                col="ctr"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-                align="right"
-              />
-              <SortHeader
-                label="Avg pos"
-                col="avg_position"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-                align="right"
-              />
-              <SortHeader
-                label="Sessions"
-                col="sessions"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-                align="right"
-              />
-              <SortHeader
-                label="Engagement"
-                col="engagement_rate"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-                align="right"
-              />
-              <SortHeader
-                label="Conv."
-                col="conversions"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-                align="right"
-              />
+              <SortHeader label="Page" col="page_path" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} />
+              <SortHeader label="Clicks" col="clicks" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} align="right" />
+              <SortHeader label="Impr." col="impressions" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} align="right" />
+              <SortHeader label="CTR" col="ctr" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} align="right" />
+              <SortHeader label="Avg pos" col="avg_position" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} align="right" />
+              <SortHeader label="Sessions" col="sessions" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} align="right" />
+              <SortHeader label="Engagement" col="engagement_rate" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} align="right" />
+              <SortHeader label="Conv." col="conversions" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} align="right" />
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
-            {visible.map((r) => {
-              const p = priorByPath.get(r.page_path);
-              return (
-                <tr key={r.page_path}>
-                  <td className="max-w-md truncate px-3 py-2" title={r.page_path}>
-                    {r.page_path}
-                  </td>
-                  <Cell
-                    value={r.clicks.toLocaleString()}
-                    delta={p ? delta(r.clicks, p.clicks) : undefined}
-                  />
-                  <Cell
-                    value={r.impressions.toLocaleString()}
-                    delta={p ? delta(r.impressions, p.impressions) : undefined}
-                  />
-                  <Cell
-                    value={fmtRate(r.ctr)}
-                    delta={p ? delta(r.ctr, p.ctr) : undefined}
-                  />
-                  <Cell
-                    value={fmtPos(r.avg_position)}
-                    delta={p ? delta(r.avg_position, p.avg_position) : undefined}
-                    invert
-                  />
-                  <Cell
-                    value={r.sessions.toLocaleString()}
-                    delta={p ? delta(r.sessions, p.sessions) : undefined}
-                  />
-                  <Cell
-                    value={fmtRate(r.engagement_rate)}
-                    delta={
-                      p ? delta(r.engagement_rate, p.engagement_rate) : undefined
-                    }
-                  />
-                  <Cell
-                    value={r.conversions.toLocaleString()}
-                    delta={p ? delta(r.conversions, p.conversions) : undefined}
-                  />
-                </tr>
-              );
-            })}
-            {visible.length === 0 && (
+            {rows.map((r) => (
+              <tr key={r.page_path}>
+                <td className="max-w-md truncate px-3 py-2" title={r.page_path}>
+                  {r.page_path}
+                </td>
+                <Cell value={r.clicks.toLocaleString()} delta={delta(r.clicks, r.prior_clicks)} />
+                <Cell value={r.impressions.toLocaleString()} delta={delta(r.impressions, r.prior_impressions)} />
+                <Cell value={fmtRate(r.ctr)} delta={delta(r.ctr, r.prior_ctr)} />
+                <Cell value={fmtPos(r.avg_position)} delta={delta(r.avg_position, r.prior_avg_position)} invert />
+                <Cell value={r.sessions.toLocaleString()} delta={delta(r.sessions, r.prior_sessions)} />
+                <Cell value={fmtRate(r.engagement_rate)} delta={delta(r.engagement_rate, r.prior_engagement_rate)} />
+                <Cell value={r.conversions.toLocaleString()} delta={delta(r.conversions, r.prior_conversions)} />
+              </tr>
+            ))}
+            {rows.length === 0 && (
               <tr>
                 <td colSpan={8} className="px-3 py-6 text-center text-sm text-zinc-500">
                   No pages for this period.
@@ -329,18 +199,59 @@ export default async function PagesExplorer(props: {
           </tbody>
         </table>
       </div>
+
+      <div className="mt-3 flex justify-end">
+        <Pager slug={slug} params={baseParams} sort={`${sortKey}_${sortDir}`} page={page} totalPages={totalPages} />
+      </div>
     </main>
   );
+}
+
+function makeQs(params: Record<string, string | undefined>): string {
+  const u = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v) u.set(k, v);
+  return u.toString();
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="flex flex-col gap-1">
-      <span className="text-xs uppercase tracking-wide text-zinc-500">
-        {label}
-      </span>
+      <span className="text-xs uppercase tracking-wide text-zinc-500">{label}</span>
       {children}
     </label>
+  );
+}
+
+function Pager({
+  slug,
+  params,
+  sort,
+  page,
+  totalPages,
+}: {
+  slug: string;
+  params: { start: string; end: string; search: string };
+  sort: string;
+  page: number;
+  totalPages: number;
+}) {
+  const href = (p: number) =>
+    `/${slug}/explore/pages?${makeQs({ ...params, sort, page: String(p) })}`;
+  const btn =
+    "rounded border border-zinc-300 px-2 py-1 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800";
+  const disabled = "pointer-events-none opacity-40";
+  return (
+    <span className="flex items-center gap-2">
+      <span>
+        Page {page} of {totalPages}
+      </span>
+      <Link href={href(Math.max(1, page - 1))} className={`${btn} ${page <= 1 ? disabled : ""}`}>
+        ← Prev
+      </Link>
+      <Link href={href(Math.min(totalPages, page + 1))} className={`${btn} ${page >= totalPages ? disabled : ""}`}>
+        Next →
+      </Link>
+    </span>
   );
 }
 
@@ -354,26 +265,21 @@ function SortHeader({
   align = "left",
 }: {
   label: string;
-  col: SortKey;
+  col: PageSortKey;
   slug: string;
   params: { start: string; end: string; search: string };
-  sortKey: SortKey;
+  sortKey: PageSortKey;
   sortDir: SortDir;
   align?: "left" | "right";
 }) {
   const isActive = sortKey === col;
   const nextDir: SortDir = isActive && sortDir === "desc" ? "asc" : "desc";
-  const qs = new URLSearchParams({
-    start: params.start,
-    end: params.end,
-    sort: `${col}_${nextDir}`,
-  });
-  if (params.search) qs.set("search", params.search);
+  const qs = makeQs({ ...params, sort: `${col}_${nextDir}` });
   const arrow = isActive ? (sortDir === "desc" ? "↓" : "↑") : "";
   return (
     <th className={`px-3 py-2 font-medium ${align === "right" ? "text-right" : ""}`}>
       <Link
-        href={`/${slug}/explore/pages?${qs.toString()}`}
+        href={`/${slug}/explore/pages?${qs}`}
         className="hover:text-zinc-700 dark:hover:text-zinc-300"
       >
         {label} {arrow}
@@ -384,31 +290,26 @@ function SortHeader({
 
 function Cell({
   value,
-  delta,
+  delta: d,
   invert = false,
 }: {
   value: string;
   delta?: number;
   invert?: boolean;
 }) {
-  // For position, lower is better — flip the delta colors.
   const goodWhenPositive = !invert;
-  const isGood = delta !== undefined && (goodWhenPositive ? delta > 0 : delta < 0);
-  const isBad = delta !== undefined && (goodWhenPositive ? delta < 0 : delta > 0);
+  const isGood = d !== undefined && (goodWhenPositive ? d > 0 : d < 0);
+  const isBad = d !== undefined && (goodWhenPositive ? d < 0 : d > 0);
   return (
     <td className="px-3 py-2 text-right tabular-nums">
       <div>{value}</div>
-      {delta !== undefined && delta !== 0 && (
+      {d !== undefined && d !== 0 && (
         <div
           className={`text-xs ${
-            isGood
-              ? "text-emerald-600"
-              : isBad
-                ? "text-red-600"
-                : "text-zinc-400"
+            isGood ? "text-emerald-600" : isBad ? "text-red-600" : "text-zinc-400"
           }`}
         >
-          {fmtPct(delta)}
+          {fmtPct(d)}
         </div>
       )}
     </td>

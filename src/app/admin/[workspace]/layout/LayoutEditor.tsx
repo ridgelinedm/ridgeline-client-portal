@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { ArrowUp, ArrowDown, Trash2, Plus } from "lucide-react";
+import { ArrowUp, ArrowDown, Trash2, Plus, GripVertical } from "lucide-react";
 import {
   WIDGET_META,
   ALL_WIDGET_TYPES,
@@ -31,6 +31,8 @@ export function LayoutEditor({
     "idle",
   );
   const [error, setError] = useState<string | null>(null);
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const [overIndex, setOverIndex] = useState<number | null>(null);
 
   const touch = () => setStatus("idle");
 
@@ -58,6 +60,17 @@ export function LayoutEditor({
   }
   function setWidth(id: string, width: 1 | 2 | 3) {
     setWidgets((w) => w.map((x) => (x.id === id ? { ...x, w: width } : x)));
+    touch();
+  }
+  function moveItem(from: number, to: number) {
+    setWidgets((w) => {
+      if (from === to || from < 0 || to < 0 || from >= w.length || to >= w.length)
+        return w;
+      const copy = [...w];
+      const [item] = copy.splice(from, 1);
+      copy.splice(to, 0, item);
+      return copy;
+    });
     touch();
   }
 
@@ -120,8 +133,34 @@ export function LayoutEditor({
           {widgets.map((w, i) => (
             <li
               key={w.id}
-              className="flex flex-wrap items-center gap-3 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800"
+              draggable
+              onDragStart={() => setDragIndex(i)}
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (overIndex !== i) setOverIndex(i);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                if (dragIndex !== null) moveItem(dragIndex, i);
+                setDragIndex(null);
+                setOverIndex(null);
+              }}
+              onDragEnd={() => {
+                setDragIndex(null);
+                setOverIndex(null);
+              }}
+              className={`flex flex-wrap items-center gap-3 rounded-lg border bg-white p-3 dark:bg-zinc-950 ${
+                dragIndex === i
+                  ? "border-zinc-400 opacity-50 dark:border-zinc-600"
+                  : overIndex === i && dragIndex !== null
+                    ? "border-indigo-400"
+                    : "border-zinc-200 dark:border-zinc-800"
+              }`}
             >
+              <GripVertical
+                className="h-4 w-4 shrink-0 cursor-grab text-zinc-400"
+                aria-hidden
+              />
               <div className="min-w-0 flex-1">
                 <div className="text-sm font-medium">
                   {WIDGET_META[w.type].label}

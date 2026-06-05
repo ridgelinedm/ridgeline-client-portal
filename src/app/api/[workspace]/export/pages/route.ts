@@ -1,11 +1,13 @@
-import { format, parseISO, subDays } from "date-fns";
+import { format, parseISO, subDays, differenceInDays } from "date-fns";
 import { agencyScopedClient } from "@/lib/auth/admin";
+import { parsePageSort } from "@/lib/explore";
 import { toCsv } from "@/lib/csv";
 
 export const maxDuration = 60;
 
 // CSV of the merged GSC + GA4 page metrics for a date range, via the
-// get_page_metrics RPC (shipped in Phase 4). Same scoping as the explorer.
+// gsc_pages_agg RPC — full result set, honouring the explorer's search/sort.
+// Same scoping as the explorer (admins any client, clients their own).
 export async function GET(
   request: Request,
   ctx: { params: Promise<{ workspace: string }> },
@@ -24,11 +26,26 @@ export async function GET(
   const start =
     url.searchParams.get("start") ||
     format(subDays(parseISO(end), 29), "yyyy-MM-dd");
+  const periodDays = differenceInDays(parseISO(end), parseISO(start)) + 1;
+  const priorEnd = format(subDays(parseISO(start), 1), "yyyy-MM-dd");
+  const priorStart = format(
+    subDays(parseISO(priorEnd), periodDays - 1),
+    "yyyy-MM-dd",
+  );
+  const search = (url.searchParams.get("search") || "").trim();
+  const { key, dir } = parsePageSort(url.searchParams.get("sort"));
 
-  const { data, error } = await supabase.rpc("get_page_metrics", {
+  const { data, error } = await supabase.rpc("gsc_pages_agg", {
     p_workspace_id: workspace.id,
     p_start: start,
     p_end: end,
+    p_prior_start: priorStart,
+    p_prior_end: priorEnd,
+    p_search: search,
+    p_sort: key,
+    p_dir: dir,
+    p_limit: 1_000_000,
+    p_offset: 0,
   });
   if (error) return new Response(error.message, { status: 500 });
 
