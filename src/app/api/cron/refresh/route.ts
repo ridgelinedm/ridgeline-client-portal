@@ -11,6 +11,7 @@ import {
   pullGa4,
   track,
   upsertWithWorkspace,
+  upsertDailySeries,
   type ResultRow,
 } from "@/lib/jobs/pulls";
 import { computeHealthRollup } from "@/lib/jobs/health-rollup";
@@ -96,6 +97,11 @@ export async function GET(request: Request) {
     }
 
     // GBP intentionally skipped until API access is approved.
+
+    // Roll up the day's totals into the all-clients grid series.
+    await track(results, ws.slug, "daily_series", async () =>
+      upsertDailySeries(supabase, ws.id, startDate, today),
+    );
 
     // Recompute health rollup after all sources have refreshed for this workspace.
     await track(results, ws.slug, "health_rollup", async () => {

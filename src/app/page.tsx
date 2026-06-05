@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
+import { isAgencyAdmin } from "@/lib/auth/admin";
 
 export default async function Home() {
   const supabase = await createClient();
@@ -8,6 +9,9 @@ export default async function Home() {
   } = await supabase.auth.getUser();
 
   if (!user) redirect("/login");
+
+  // Agency operators land on the all-clients grid; clients see their own list.
+  if (await isAgencyAdmin()) redirect("/admin");
 
   const { data: memberships } = await supabase
     .from("workspace_members")

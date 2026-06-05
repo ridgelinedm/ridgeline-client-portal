@@ -1,12 +1,20 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { pullGsc, pullGa4, type ResultRow } from "@/lib/jobs/pulls";
+import { isAgencyAdminRequest } from "@/lib/auth/admin";
+import {
+  pullGsc,
+  pullGa4,
+  upsertDailySeries,
+  track,
+  type ResultRow,
+} from "@/lib/jobs/pulls";
 
-// Admin-only one-shot backfill. Called by scripts/backfill-workspace.mjs once
-// per (workspace × month-window) so each request stays inside the 60s budget.
-// Skips Ahrefs intentionally — historical depth isn't meaningful at the
-// account tier we're on and the daily snapshot only makes sense for "today".
+// Admin one-shot backfill for one (workspace × date-window). Called per month by
+// scripts/backfill-workspace.mjs (Bearer CRON_SECRET) AND by the onboarding UI
+// (agency-admin session) — isAgencyAdminRequest accepts either. Skips Ahrefs
+// intentionally — historical depth isn't meaningful at the account tier we're
+// on and the daily snapshot only makes sense for "today".
 
 export const maxDuration = 60;
 
@@ -17,9 +25,8 @@ const BodySchema = z.object({
 });
 
 export async function POST(request: Request) {
-  const auth = request.headers.get("authorization");
-  if (auth !== `Bearer ${process.env.CRON_SECRET}`) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  if (!(await isAgencyAdminRequest(request))) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
 
   const parsed = BodySchema.safeParse(await request.json());
@@ -49,6 +56,11 @@ export async function POST(request: Request) {
   if (ws.ga4_property_id) {
     await pullGa4(supabase, ws, start_date, end_date, results);
   }
+
+  // Populate the all-clients grid series for this window too.
+  await track(results, ws.slug, "daily_series", async () =>
+    upsertDailySeries(supabase, ws.id, start_date, end_date),
+  );
 
   return NextResponse.json({
     ok: true,

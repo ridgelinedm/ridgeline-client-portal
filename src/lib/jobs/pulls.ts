@@ -244,3 +244,57 @@ export async function upsertLegacyMetricSnapshots(
     onConflict: "workspace_id,source,metric_date,metric_key,dimensions_hash",
   });
 }
+
+// Roll the per-day GSC clicks/impressions + GA4 sessions/conversions (the legacy
+// metric_snapshots daily totals pullGsc/pullGa4 just wrote) into
+// workspace_daily_series — the lightweight per-day source the all-clients grid
+// reads for headline totals + sparklines. Called after the pulls by both the
+// cron and the admin backfill, so the grid stays current and gains history.
+export async function upsertDailySeries(
+  supabase: AdminClient,
+  workspaceId: string,
+  startDate: string,
+  endDate: string,
+): Promise<number> {
+  const { data } = await supabase
+    .from("metric_snapshots")
+    .select("source, metric_date, metric_key, metric_value")
+    .eq("workspace_id", workspaceId)
+    .gte("metric_date", startDate)
+    .lte("metric_date", endDate)
+    .is("dimensions", null)
+    .in("metric_key", ["clicks", "impressions", "sessions", "conversions"]);
+
+  const byDate = new Map<
+    string,
+    { clicks: number; impressions: number; sessions: number; conversions: number }
+  >();
+  for (const r of (data ?? []) as Array<{
+    source: string;
+    metric_date: string;
+    metric_key: string;
+    metric_value: number;
+  }>) {
+    let e = byDate.get(r.metric_date);
+    if (!e) {
+      e = { clicks: 0, impressions: 0, sessions: 0, conversions: 0 };
+      byDate.set(r.metric_date, e);
+    }
+    const v = Number(r.metric_value);
+    if (r.source === "gsc" && r.metric_key === "clicks") e.clicks = v;
+    else if (r.source === "gsc" && r.metric_key === "impressions") e.impressions = v;
+    else if (r.source === "ga4" && r.metric_key === "sessions") e.sessions = v;
+    else if (r.source === "ga4" && r.metric_key === "conversions") e.conversions = v;
+  }
+
+  const rows = [...byDate.entries()].map(([date, e]) => ({
+    workspace_id: workspaceId,
+    date,
+    ...e,
+  }));
+  if (rows.length === 0) return 0;
+  await supabase
+    .from("workspace_daily_series")
+    .upsert(rows, { onConflict: "workspace_id,date" });
+  return rows.length;
+}

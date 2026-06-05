@@ -1,0 +1,40 @@
+# Daily data refresh.
+#
+# Vercel ignores vercel.json crons on the Hobby plan, so the daily pull is driven
+# from here instead — a free, scheduled GitHub Actions job that hits the cron
+# dispatcher. The dispatcher fans out to one worker per workspace; every upsert
+# is idempotent and the endpoint re-pulls a rolling 7-day window, so a missed or
+# delayed run self-heals on the next one.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   APP_URL      Base URL of the deployment, e.g. https://ridgeline-client-portal.vercel.app
+#   CRON_SECRET  Same value as the CRON_SECRET env var in the Vercel project
+#
+# You can also run it on demand from the Actions tab (workflow_dispatch).
+
+name: Daily data refresh
+
+on:
+  schedule:
+    - cron: "0 9 * * *" # 09:00 UTC daily (matches vercel.json)
+  workflow_dispatch: {}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger cron dispatcher
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -X GET \
+            -o /tmp/refresh.json -w "%{http_code}" \
+            --max-time 300 \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "${{ secrets.APP_URL }}/api/cron/refresh")
+          echo "HTTP $code"
+          cat /tmp/refresh.json
+          echo
+          if [ "$code" != "200" ]; then
+            echo "::error::Refresh dispatcher returned HTTP $code"
+            exit 1
+          fi

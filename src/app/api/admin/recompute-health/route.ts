@@ -2,10 +2,13 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { addDays, format, parseISO } from "date-fns";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { isAgencyAdminRequest } from "@/lib/auth/admin";
 import { computeHealthRollup } from "@/lib/jobs/health-rollup";
 
 // Recompute workspace_health_daily for every date in [start_date, end_date].
-// Used by the backfill script as a final pass after all source data is in.
+// Used by the backfill script (Bearer CRON_SECRET) as a final pass after all
+// source data is in, and by the onboarding UI (agency-admin session) to seed the
+// latest health row — isAgencyAdminRequest accepts either.
 
 export const maxDuration = 60;
 
@@ -16,9 +19,8 @@ const BodySchema = z.object({
 });
 
 export async function POST(request: Request) {
-  const auth = request.headers.get("authorization");
-  if (auth !== `Bearer ${process.env.CRON_SECRET}`) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  if (!(await isAgencyAdminRequest(request))) {
+    return NextResponse.json({ error: "forbidden" }, { status: 403 });
   }
 
   const parsed = BodySchema.safeParse(await request.json());
