@@ -2,95 +2,29 @@ import { notFound } from "next/navigation";
 import Link from "next/link";
 import { differenceInDays, format, parseISO, subDays } from "date-fns";
 import { agencyScopedClient } from "@/lib/auth/admin";
+import { delta, fmtPct } from "@/lib/format";
+import { parseSort, type SortKey, type SortDir } from "@/lib/explore";
 
 export const dynamic = "force-dynamic";
 
-type DailyRow = {
+const PAGE_SIZE = 100;
+
+type Row = {
   query: string;
   clicks: number;
   impressions: number;
   ctr: number;
-  position: number;
+  avg_position: number;
+  prior_clicks: number;
+  prior_impressions: number;
+  prior_ctr: number;
+  prior_avg_position: number;
+  total_count: number;
 };
-
-type AggregatedRow = {
-  query: string;
-  clicks: number;
-  impressions: number;
-  ctr: number;
-  position: number;
-};
-
-type SortKey = "clicks" | "impressions" | "ctr" | "position" | "query";
-type SortDir = "asc" | "desc";
-
-const ROW_CAP = 50000;
-const DISPLAY_CAP = 1000;
-
-function aggregate(rows: DailyRow[]): AggregatedRow[] {
-  const byQuery = new Map<
-    string,
-    {
-      clicks: number;
-      impressions: number;
-      ctrNumerator: number;
-      positionNumerator: number;
-    }
-  >();
-  for (const r of rows) {
-    const e = byQuery.get(r.query) ?? {
-      clicks: 0,
-      impressions: 0,
-      ctrNumerator: 0,
-      positionNumerator: 0,
-    };
-    e.clicks += r.clicks;
-    e.impressions += r.impressions;
-    // CTR and avg position are weighted by impressions so the daily averages
-    // roll up correctly.
-    e.ctrNumerator += r.ctr * r.impressions;
-    e.positionNumerator += r.position * r.impressions;
-    byQuery.set(r.query, e);
-  }
-  return [...byQuery.entries()].map(([query, e]) => ({
-    query,
-    clicks: e.clicks,
-    impressions: e.impressions,
-    ctr: e.impressions > 0 ? e.ctrNumerator / e.impressions : 0,
-    position: e.impressions > 0 ? e.positionNumerator / e.impressions : 0,
-  }));
-}
-
-function parseSort(raw: string | undefined): { key: SortKey; dir: SortDir } {
-  const allowed: SortKey[] = [
-    "clicks",
-    "impressions",
-    "ctr",
-    "position",
-    "query",
-  ];
-  const [keyRaw, dirRaw] = (raw ?? "clicks_desc").split("_");
-  const key = (allowed as string[]).includes(keyRaw)
-    ? (keyRaw as SortKey)
-    : "clicks";
-  const dir: SortDir = dirRaw === "asc" ? "asc" : "desc";
-  return { key, dir };
-}
-
-function delta(curr: number, prev: number) {
-  if (prev === 0) return curr === 0 ? 0 : 1;
-  return (curr - prev) / prev;
-}
-
-function fmtPct(n: number) {
-  const sign = n > 0 ? "+" : "";
-  return `${sign}${(n * 100).toFixed(1)}%`;
-}
 
 function fmtCtr(n: number) {
   return `${(n * 100).toFixed(2)}%`;
 }
-
 function fmtPos(n: number) {
   return n.toFixed(1);
 }
@@ -102,6 +36,7 @@ export default async function QueriesExplorer(props: {
     end?: string;
     search?: string;
     sort?: string;
+    page?: string;
   }>;
 }) {
   const { workspace: slug } = await props.params;
@@ -115,8 +50,7 @@ export default async function QueriesExplorer(props: {
     .maybeSingle();
   if (!workspace) notFound();
 
-  const today = new Date();
-  const end = sp.end ?? format(today, "yyyy-MM-dd");
+  const end = sp.end ?? format(new Date(), "yyyy-MM-dd");
   const start = sp.start ?? format(subDays(parseISO(end), 29), "yyyy-MM-dd");
   const periodDays = differenceInDays(parseISO(end), parseISO(start)) + 1;
   const priorEnd = format(subDays(parseISO(start), 1), "yyyy-MM-dd");
@@ -127,43 +61,34 @@ export default async function QueriesExplorer(props: {
 
   const search = sp.search?.trim() ?? "";
   const { key: sortKey, dir: sortDir } = parseSort(sp.sort);
+  const page = Math.max(1, parseInt(sp.page ?? "1", 10) || 1);
+  const offset = (page - 1) * PAGE_SIZE;
 
-  let currentQuery = supabase
-    .from("gsc_query_daily")
-    .select("query,clicks,impressions,ctr,position")
-    .eq("workspace_id", workspace.id)
-    .gte("date", start)
-    .lte("date", end)
-    .range(0, ROW_CAP - 1);
-  let priorQuery = supabase
-    .from("gsc_query_daily")
-    .select("query,clicks,impressions,ctr,position")
-    .eq("workspace_id", workspace.id)
-    .gte("date", priorStart)
-    .lte("date", priorEnd)
-    .range(0, ROW_CAP - 1);
-  if (search) {
-    currentQuery = currentQuery.ilike("query", `%${search}%`);
-    priorQuery = priorQuery.ilike("query", `%${search}%`);
-  }
-
-  const [{ data: currentRows }, { data: priorRows }] = await Promise.all([
-    currentQuery,
-    priorQuery,
-  ]);
-
-  const current = aggregate((currentRows ?? []) as DailyRow[]);
-  const prior = aggregate((priorRows ?? []) as DailyRow[]);
-  const priorByQuery = new Map(prior.map((r) => [r.query, r]));
-
-  const sorted = [...current].sort((a, b) => {
-    const cmp =
-      sortKey === "query"
-        ? a.query.localeCompare(b.query)
-        : (a[sortKey] as number) - (b[sortKey] as number);
-    return sortDir === "asc" ? cmp : -cmp;
+  const { data: rpcData } = await supabase.rpc("gsc_queries_agg", {
+    p_workspace_id: workspace.id,
+    p_start: start,
+    p_end: end,
+    p_prior_start: priorStart,
+    p_prior_end: priorEnd,
+    p_search: search,
+    p_sort: sortKey,
+    p_dir: sortDir,
+    p_limit: PAGE_SIZE,
+    p_offset: offset,
   });
-  const visible = sorted.slice(0, DISPLAY_CAP);
+  const rows = (rpcData ?? []) as Row[];
+  const total = Number(rows[0]?.total_count ?? 0);
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const firstRow = total === 0 ? 0 : offset + 1;
+  const lastRow = Math.min(offset + rows.length, total);
+
+  const baseParams = { start, end, search };
+  const exportQs = makeQs({
+    start,
+    end,
+    search,
+    sort: `${sortKey}_${sortDir}`,
+  });
 
   return (
     <main className="mx-auto max-w-7xl px-6 py-10">
@@ -175,13 +100,17 @@ export default async function QueriesExplorer(props: {
           >
             ← {workspace.name}
           </Link>
-          <h1 className="mt-1 text-2xl font-semibold tracking-tight">
-            Queries
-          </h1>
+          <h1 className="mt-1 text-2xl font-semibold tracking-tight">Queries</h1>
           <p className="text-sm text-zinc-500">
             {start} → {end} · vs. {priorStart} → {priorEnd}
           </p>
         </div>
+        <a
+          href={`/api/${slug}/export/queries?${exportQs}`}
+          className="rounded border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+        >
+          Download CSV
+        </a>
       </header>
 
       <form className="mt-6 flex flex-wrap items-end gap-3">
@@ -219,84 +148,42 @@ export default async function QueriesExplorer(props: {
         </button>
       </form>
 
-      <p className="mt-4 text-xs text-zinc-500">
-        {current.length.toLocaleString()} queries
-        {sorted.length > DISPLAY_CAP
-          ? ` · showing top ${DISPLAY_CAP.toLocaleString()}`
-          : ""}
-      </p>
+      <div className="mt-4 flex items-center justify-between text-xs text-zinc-500">
+        <span>
+          {total.toLocaleString()} queries
+          {total > 0 ? ` · showing ${firstRow.toLocaleString()}–${lastRow.toLocaleString()}` : ""}
+        </span>
+        <Pager
+          slug={slug}
+          params={baseParams}
+          sort={`${sortKey}_${sortDir}`}
+          page={page}
+          totalPages={totalPages}
+        />
+      </div>
 
       <div className="mt-2 overflow-x-auto rounded-xl border border-zinc-200 dark:border-zinc-800">
         <table className="min-w-full text-sm">
           <thead className="bg-zinc-50 text-left text-xs uppercase tracking-wide text-zinc-500 dark:bg-zinc-900">
             <tr>
-              <SortHeader
-                label="Query"
-                col="query"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-              />
-              <SortHeader
-                label="Clicks"
-                col="clicks"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-                align="right"
-              />
-              <SortHeader
-                label="Impressions"
-                col="impressions"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-                align="right"
-              />
-              <SortHeader
-                label="CTR"
-                col="ctr"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-                align="right"
-              />
-              <SortHeader
-                label="Avg position"
-                col="position"
-                slug={slug}
-                params={{ start, end, search }}
-                sortKey={sortKey}
-                sortDir={sortDir}
-                align="right"
-              />
+              <SortHeader label="Query" col="query" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} />
+              <SortHeader label="Clicks" col="clicks" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} align="right" />
+              <SortHeader label="Impressions" col="impressions" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} align="right" />
+              <SortHeader label="CTR" col="ctr" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} align="right" />
+              <SortHeader label="Avg position" col="position" slug={slug} params={baseParams} sortKey={sortKey} sortDir={sortDir} align="right" />
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800">
-            {visible.map((r) => {
-              const p = priorByQuery.get(r.query);
-              return (
-                <tr key={r.query}>
-                  <td className="px-3 py-2">{r.query}</td>
-                  <Cell value={r.clicks.toLocaleString()} delta={p ? delta(r.clicks, p.clicks) : undefined} />
-                  <Cell
-                    value={r.impressions.toLocaleString()}
-                    delta={p ? delta(r.impressions, p.impressions) : undefined}
-                  />
-                  <Cell value={fmtCtr(r.ctr)} delta={p ? delta(r.ctr, p.ctr) : undefined} />
-                  <Cell
-                    value={fmtPos(r.position)}
-                    delta={p ? delta(r.position, p.position) : undefined}
-                    invert
-                  />
-                </tr>
-              );
-            })}
-            {visible.length === 0 && (
+            {rows.map((r) => (
+              <tr key={r.query}>
+                <td className="px-3 py-2">{r.query}</td>
+                <Cell value={r.clicks.toLocaleString()} delta={delta(r.clicks, r.prior_clicks)} />
+                <Cell value={r.impressions.toLocaleString()} delta={delta(r.impressions, r.prior_impressions)} />
+                <Cell value={fmtCtr(r.ctr)} delta={delta(r.ctr, r.prior_ctr)} />
+                <Cell value={fmtPos(r.avg_position)} delta={delta(r.avg_position, r.prior_avg_position)} invert />
+              </tr>
+            ))}
+            {rows.length === 0 && (
               <tr>
                 <td colSpan={5} className="px-3 py-6 text-center text-sm text-zinc-500">
                   No queries for this period.
@@ -306,18 +193,68 @@ export default async function QueriesExplorer(props: {
           </tbody>
         </table>
       </div>
+
+      <div className="mt-3 flex justify-end">
+        <Pager
+          slug={slug}
+          params={baseParams}
+          sort={`${sortKey}_${sortDir}`}
+          page={page}
+          totalPages={totalPages}
+        />
+      </div>
     </main>
   );
+}
+
+function makeQs(params: Record<string, string | undefined>): string {
+  const u = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v) u.set(k, v);
+  return u.toString();
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="flex flex-col gap-1">
-      <span className="text-xs uppercase tracking-wide text-zinc-500">
-        {label}
-      </span>
+      <span className="text-xs uppercase tracking-wide text-zinc-500">{label}</span>
       {children}
     </label>
+  );
+}
+
+function Pager({
+  slug,
+  params,
+  sort,
+  page,
+  totalPages,
+}: {
+  slug: string;
+  params: { start: string; end: string; search: string };
+  sort: string;
+  page: number;
+  totalPages: number;
+}) {
+  const href = (p: number) =>
+    `/${slug}/explore/queries?${makeQs({ ...params, sort, page: String(p) })}`;
+  const btn =
+    "rounded border border-zinc-300 px-2 py-1 hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800";
+  const disabled = "pointer-events-none opacity-40";
+  return (
+    <span className="flex items-center gap-2">
+      <span>
+        Page {page} of {totalPages}
+      </span>
+      <Link href={href(Math.max(1, page - 1))} className={`${btn} ${page <= 1 ? disabled : ""}`}>
+        ← Prev
+      </Link>
+      <Link
+        href={href(Math.min(totalPages, page + 1))}
+        className={`${btn} ${page >= totalPages ? disabled : ""}`}
+      >
+        Next →
+      </Link>
+    </span>
   );
 }
 
@@ -340,17 +277,13 @@ function SortHeader({
 }) {
   const isActive = sortKey === col;
   const nextDir: SortDir = isActive && sortDir === "desc" ? "asc" : "desc";
-  const qs = new URLSearchParams({
-    start: params.start,
-    end: params.end,
-    sort: `${col}_${nextDir}`,
-  });
-  if (params.search) qs.set("search", params.search);
+  // Changing sort resets to page 1.
+  const qs = makeQs({ ...params, sort: `${col}_${nextDir}` });
   const arrow = isActive ? (sortDir === "desc" ? "↓" : "↑") : "";
   return (
     <th className={`px-3 py-2 font-medium ${align === "right" ? "text-right" : ""}`}>
       <Link
-        href={`/${slug}/explore/queries?${qs.toString()}`}
+        href={`/${slug}/explore/queries?${qs}`}
         className="hover:text-zinc-700 dark:hover:text-zinc-300"
       >
         {label} {arrow}
@@ -361,31 +294,26 @@ function SortHeader({
 
 function Cell({
   value,
-  delta,
+  delta: d,
   invert = false,
 }: {
   value: string;
   delta?: number;
   invert?: boolean;
 }) {
-  // For position, lower is better — so a "negative delta" is actually good.
   const goodWhenPositive = !invert;
-  const isGood = delta !== undefined && (goodWhenPositive ? delta > 0 : delta < 0);
-  const isBad = delta !== undefined && (goodWhenPositive ? delta < 0 : delta > 0);
+  const isGood = d !== undefined && (goodWhenPositive ? d > 0 : d < 0);
+  const isBad = d !== undefined && (goodWhenPositive ? d < 0 : d > 0);
   return (
     <td className="px-3 py-2 text-right tabular-nums">
       <div>{value}</div>
-      {delta !== undefined && delta !== 0 && (
+      {d !== undefined && d !== 0 && (
         <div
           className={`text-xs ${
-            isGood
-              ? "text-emerald-600"
-              : isBad
-                ? "text-red-600"
-                : "text-zinc-400"
+            isGood ? "text-emerald-600" : isBad ? "text-red-600" : "text-zinc-400"
           }`}
         >
-          {fmtPct(delta)}
+          {fmtPct(d)}
         </div>
       )}
     </td>
