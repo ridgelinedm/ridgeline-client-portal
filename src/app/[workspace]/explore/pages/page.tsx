@@ -1,7 +1,7 @@
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import { differenceInDays, format, parseISO, subDays } from "date-fns";
-import { createClient } from "@/lib/supabase/server";
+import { agencyScopedClient } from "@/lib/auth/admin";
 
 export const dynamic = "force-dynamic";
 
@@ -83,7 +83,7 @@ export default async function PagesExplorer(props: {
   const { workspace: slug } = await props.params;
   const sp = await props.searchParams;
 
-  const supabase = await createClient();
+  const supabase = await agencyScopedClient();
   const { data: workspace } = await supabase
     .from("workspaces")
     .select("*")

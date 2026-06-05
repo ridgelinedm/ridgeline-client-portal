@@ -7,6 +7,7 @@ import { createClient } from "@supabase/supabase-js";
 //   - src/app/api/cron/refresh/route.ts   (daily refresh loop)
 //   - src/app/api/admin/*                 (backfill, recompute-health, workspaces)
 //   - src/app/admin/*                     (agency dashboard pages)
+//   - src/lib/auth/admin.ts               (agencyScopedClient — gates on isAgencyAdmin first)
 // Every admin path MUST gate on requireAgencyAdmin()/isAgencyAdminRequest()
 // (src/lib/auth/admin.ts) BEFORE using this client; cron paths are gated by the
 // CRON_SECRET bearer.

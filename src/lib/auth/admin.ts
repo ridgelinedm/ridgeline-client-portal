@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 
 // Hard server-side gate for agency-admin-only pages and actions.
 //
@@ -50,4 +51,14 @@ export async function isAgencyAdminRequest(request: Request): Promise<boolean> {
   const auth = request.headers.get("authorization");
   if (auth && auth === `Bearer ${process.env.CRON_SECRET}`) return true;
   return isAgencyAdmin();
+}
+
+// Pick the Supabase client for reading a single client workspace on the shared
+// /[workspace] pages: the service-role client for agency admins (so they can
+// view ANY client, like the all-clients grid does), otherwise the RLS-bound
+// client (a client only sees workspaces they're a member of). Server-only —
+// the service-role client is constructed ONLY after confirming admin status.
+export async function agencyScopedClient() {
+  if (await isAgencyAdmin()) return createAdminClient();
+  return createClient();
 }
